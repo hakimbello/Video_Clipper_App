@@ -1,0 +1,7 @@
+venv/
+clips_output/
+__pycache__/
+clipper/__pycache__/
+*.pyc
+*.mp4
+*.srt
