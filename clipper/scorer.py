@@ -10,6 +10,10 @@ Design philosophy:
 """
 
 from typing import List, Dict, Tuple
+try:
+    from clipper.feedback import get_feedback_score
+except Exception:
+    def get_feedback_score(text): return 0
 
 
 # ── Platform and content type targets ────────────────────────────────────────
@@ -423,7 +427,7 @@ def get_top_clips(
             "text":       c["text"].strip(),
             "gap_before": c["gap_before"],
             "gap_after":  c["gap_after"],
-            "score":      seg_score,
+            "score":      seg_score + get_feedback_score(c["text"].strip()),
             "duration":   round(duration, 2),
         })
 

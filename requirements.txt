@@ -1,3 +1,5 @@
 faster-whisper
 streamlit
 ffmpeg-python
+opencv-python
+yt-dlp

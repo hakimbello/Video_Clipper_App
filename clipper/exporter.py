@@ -12,6 +12,13 @@ import os
 import subprocess
 from typing import List, Dict, Callable, Optional
 
+# Face detection for smart reframing (optional — falls back to center crop if unavailable)
+try:
+    import cv2
+    OPENCV_AVAILABLE = True
+except ImportError:
+    OPENCV_AVAILABLE = False
+
 PADDING_SECONDS = 1.5
 
 FONT_NAME      = "Arial"
@@ -185,6 +192,76 @@ def _build_srt(
 
 # ── ffmpeg helpers ────────────────────────────────────────────────────────────
 
+
+
+def _detect_face_crop(video_path: str, aspect_ratio: str) -> str:
+    """
+    Sample frames from the video and detect the most common face position.
+    Returns an ffmpeg crop filter string centered on the face.
+    Falls back to center crop if OpenCV is unavailable or no face is found.
+
+    This makes vertical crops look professional — the speaker stays in frame
+    even if they are not perfectly centered in the original video.
+    """
+    if not OPENCV_AVAILABLE or aspect_ratio != "vertical":
+        return ASPECT_RATIOS.get(aspect_ratio, ASPECT_RATIOS["vertical"])[2]
+
+    try:
+        cap = cv2.VideoCapture(video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25
+        orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+
+        # Sample one frame every 2 seconds
+        sample_interval = max(1, int(fps * 2))
+        face_x_positions = []
+
+        for frame_idx in range(0, min(total_frames, int(fps * 60)), sample_interval):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray, 1.1, 4, minSize=(60, 60))
+            for (x, y, w, h) in faces:
+                face_x_positions.append(x + w // 2)
+
+        cap.release()
+
+        if not face_x_positions:
+            return ASPECT_RATIOS["vertical"][2]
+
+        # Average face center X position
+        avg_face_x = int(sum(face_x_positions) / len(face_x_positions))
+
+        # Target output: 1080 wide from a 1920-tall source
+        target_w = 1080
+        target_h = 1920
+
+        # Scale the original so height = 1920
+        scale = target_h / orig_h
+        scaled_w = int(orig_w * scale)
+
+        # Crop X centered on face, clamped to bounds
+        crop_x = int(avg_face_x * scale) - target_w // 2
+        crop_x = max(0, min(crop_x, scaled_w - target_w))
+
+        filter_str = (
+            f"scale={scaled_w}:{target_h},"
+            f"crop={target_w}:{target_h}:{crop_x}:0"
+        )
+        print(f"  Face detected at avg x={avg_face_x}px → smart crop offset x={crop_x}")
+        return filter_str
+
+    except Exception as e:
+        print(f"  Face detection failed ({e}), using center crop.")
+        return ASPECT_RATIOS["vertical"][2]
+
 def _run_ffmpeg(command: str) -> bool:
     try:
         subprocess.run(
@@ -223,6 +300,7 @@ def export_clips(
     headlines=None,                              # ignored, kept for compatibility
     aspect_ratio: str = "vertical",             # vertical | square | horizontal
     export_srt: bool = True,                    # whether to also save .srt files
+    smart_reframe: bool = True,                 # use face detection for crop position
     progress_callback: Optional[Callable] = None,
 ) -> List[str]:
     """
@@ -247,7 +325,12 @@ def export_clips(
     os.makedirs(output_dir, exist_ok=True)
 
     ratio_config = ASPECT_RATIOS.get(aspect_ratio, ASPECT_RATIOS["vertical"])
-    vf_filter    = ratio_config[2]
+    # Use face detection to find smart crop position (falls back to center if unavailable)
+    if smart_reframe and OPENCV_AVAILABLE and aspect_ratio == "vertical":
+        print("  Detecting face position for smart reframing...")
+        vf_filter = _detect_face_crop(video_path, aspect_ratio)
+    else:
+        vf_filter = ratio_config[2]
 
     exported = []
     total    = len(clips)
