@@ -24,6 +24,7 @@ from datetime import datetime
 from clipper.transcriber import transcribe_video
 from clipper.scorer import get_top_clips, calculate_target_clip_count, HOOK_PHRASES
 from clipper.exporter import export_clips, OPENCV_AVAILABLE
+from clipper.text_modes import TEXT_MODES
 from clipper.feedback import record_feedback, get_feedback_stats, reset_feedback
 
 st.set_page_config(
@@ -147,6 +148,21 @@ with tab_clip:
             options=["conservative", "balanced", "aggressive"],
             index=1,
         )
+
+    # ── Text mode selector ────────────────────────────────────────────────────
+    mode_keys    = list(TEXT_MODES.keys())
+    mode_labels  = [TEXT_MODES[k]["label"] for k in mode_keys]
+    mode_descs   = [TEXT_MODES[k]["description"] for k in mode_keys]
+
+    selected_label = st.selectbox(
+        "📝 Caption style",
+        options=mode_labels,
+        index=0,
+        help="Choose how text appears on your exported clips."
+    )
+    selected_mode_idx = mode_labels.index(selected_label)
+    text_mode = mode_keys[selected_mode_idx]
+    st.caption(f"ℹ️ {mode_descs[selected_mode_idx]}")
 
     use_manual_count = st.checkbox("Set clip count manually", value=False)
     manual_top_n = None
@@ -340,6 +356,7 @@ with tab_clip:
                         aspect_ratio=aspect_ratio,
                         export_srt=export_srt,
                         smart_reframe=smart_reframe,
+                        text_mode=text_mode,
                         progress_callback=lambda i, total: progress.progress(i / total),
                     )
                 progress.progress(1.0)
@@ -351,6 +368,7 @@ with tab_clip:
                 "clips":      len(approved_clips),
                 "platform":   platform,
                 "mode":       mode,
+                "text_mode":  text_mode,
                 "duration":   f"{int(st.session_state['video_duration'] // 60)}m",
             })
 

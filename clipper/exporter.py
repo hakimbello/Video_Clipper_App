@@ -1,18 +1,23 @@
 """
 clipper/exporter.py
-Cuts video clips, burns in Opus-style captions, and exports SRT files.
+Cuts video clips, burns captions, exports SRT files.
 
-New in this version:
-- Aspect ratio options: vertical (9:16), square (1:1), horizontal (16:9)
-- SRT subtitle file exported alongside every video clip
-- No headlines
+Text mode support added:
+  raw_transcript  — word-by-word yellow highlight at bottom (original behavior)
+  clean_subtitle  — grouped lines, no highlight, at bottom
+  viral_hook      — hook text at top + subtitles at bottom (two ASS layers)
+  caption_summary — one static summary line at bottom
+
+All mode logic lives in clipper/text_modes.py.
+This file only handles rendering and ffmpeg.
 """
 
 import os
 import subprocess
 from typing import List, Dict, Callable, Optional
+from clipper.text_modes import build_text_layers, TEXT_MODES
 
-# Face detection for smart reframing (optional — falls back to center crop if unavailable)
+# Face detection (optional)
 try:
     import cv2
     OPENCV_AVAILABLE = True
@@ -28,12 +33,12 @@ WORDS_PER_LINE = 2
 MARGIN_V       = 700
 MARGIN_LR      = 80
 
-TEXT_COLOR      = "&H00FFFFFF"
-OUTLINE_COLOR   = "&H00000000"
-HIGHLIGHT_COLOR = "&H0000FFFF"
+TEXT_COLOR      = "&H00FFFFFF"   # white
+OUTLINE_COLOR   = "&H00000000"   # black
+HIGHLIGHT_COLOR = "&H0000FFFF"   # yellow
 BOX_COLOR       = "&H00000000"
+HOOK_COLOR      = "&H0000FFFF"   # yellow for hook text at top
 
-# Aspect ratio presets: (output_width, output_height, ffmpeg_scale_crop)
 ASPECT_RATIOS = {
     "vertical":   (1080, 1920, "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"),
     "square":     (1080, 1080, "scale=1080:1080:force_original_aspect_ratio=increase,crop=1080:1080"),
@@ -41,7 +46,7 @@ ASPECT_RATIOS = {
 }
 
 
-# ── ASS subtitle helpers ──────────────────────────────────────────────────────
+# ── ASS helpers ───────────────────────────────────────────────────────────────
 
 def _escape_ass(text: str) -> str:
     return text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
@@ -55,66 +60,69 @@ def _to_ass_time(seconds: float) -> str:
     return f"{h}:{m:02d}:{s:05.2f}"
 
 
-def _build_opus_captions_ass(
-    words: List[Dict],
-    clip_start: float,
-    clip_duration: float,
-    fallback_text: str = "",
-    aspect_ratio: str = "vertical",
-) -> str:
-    """Build ASS subtitle file with Opus-style word-by-word highlighting."""
-
-    # Adjust resolution and caption position per aspect ratio
-    if aspect_ratio == "square":
-        play_res_x, play_res_y = 1080, 1080
-        margin_v = 400
-    elif aspect_ratio == "horizontal":
-        play_res_x, play_res_y = 1920, 1080
-        margin_v = 120
-    else:
-        play_res_x, play_res_y = 1080, 1920
-        margin_v = MARGIN_V
-
-    header = f"""[Script Info]
+def _ass_header(play_res_x: int, play_res_y: int, styles: str) -> str:
+    """Build an ASS file header with custom styles."""
+    return f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {play_res_x}
 PlayResY: {play_res_y}
-WrapStyle: 0
+WrapStyle: 1
 ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
-Style: Cap,{FONT_NAME},{FONT_SIZE},{TEXT_COLOR},&H000000FF,{OUTLINE_COLOR},{BOX_COLOR},{FONT_BOLD},0,0,0,100,100,2,0,1,5,0,2,{MARGIN_LR},{MARGIN_LR},{margin_v},1
-
+{styles}
 [Events]
 Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
 """
-    lines = []
+
+
+def _get_res_and_margins(aspect_ratio: str):
+    """Return (play_res_x, play_res_y, bottom_margin_v, top_margin_v) per ratio."""
+    if aspect_ratio == "square":
+        return 1080, 1080, 380, 80
+    elif aspect_ratio == "horizontal":
+        return 1920, 1080, 100, 60
+    else:  # vertical
+        return 1080, 1920, MARGIN_V, 120
+
+
+# ── Mode 1: Raw transcript (word-by-word yellow highlight) ────────────────────
+
+def _build_raw_transcript_ass(
+    words: List[Dict],
+    clip_start: float,
+    clip_duration: float,
+    fallback_text: str,
+    aspect_ratio: str,
+) -> str:
+    """Original Opus-style word-by-word highlighted captions."""
+    rx, ry, margin_v, _ = _get_res_and_margins(aspect_ratio)
+
+    style = (
+        f"Style: Cap,{FONT_NAME},{FONT_SIZE},{TEXT_COLOR},&H000000FF,"
+        f"{OUTLINE_COLOR},{BOX_COLOR},{FONT_BOLD},0,0,0,100,100,2,0,1,5,0,"
+        f"2,{MARGIN_LR},{MARGIN_LR},{margin_v},1"
+    )
+    header = _ass_header(rx, ry, style)
+    lines  = []
 
     if not words:
-        text = _escape_ass(fallback_text.strip().upper())
         lines.append(
             f"Dialogue: 0,{_to_ass_time(0)},{_to_ass_time(clip_duration)},"
-            f"Cap,,0,0,0,,{text}"
+            f"Cap,,0,0,0,,{_escape_ass(fallback_text.upper())}"
         )
         return header + "\n".join(lines) + "\n"
 
     chunks = [words[i: i + WORDS_PER_LINE] for i in range(0, len(words), WORDS_PER_LINE)]
-
     for chunk in chunks:
         if not chunk:
             continue
-        chunk_start = max(0.0, chunk[0]["start"] - clip_start)
-        chunk_end   = min(clip_duration, chunk[-1]["end"] - clip_start)
-        if chunk_end <= chunk_start:
-            continue
-
         for active_idx, active_word in enumerate(chunk):
             w_start = max(0.0, active_word["start"] - clip_start)
             w_end   = min(clip_duration, active_word["end"] - clip_start)
             if w_end <= w_start:
                 continue
-
             parts = []
             for j, w in enumerate(chunk):
                 word_text = _escape_ass(w["word"].strip().upper())
@@ -122,7 +130,6 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
                     parts.append(f"{{\\c{HIGHLIGHT_COLOR}&}}{word_text}{{\\c{TEXT_COLOR}&}}")
                 else:
                     parts.append(word_text)
-
             lines.append(
                 f"Dialogue: 0,{_to_ass_time(w_start)},{_to_ass_time(w_end)},"
                 f"Cap,,0,0,0,,{'  '.join(parts)}"
@@ -131,10 +138,205 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
     return header + "\n".join(lines) + "\n"
 
 
-# ── SRT export ────────────────────────────────────────────────────────────────
+# ── Mode 2: Clean subtitle (grouped lines, no highlight) ─────────────────────
+
+def _build_clean_subtitle_ass(
+    words: List[Dict],
+    clip_start: float,
+    clip_duration: float,
+    fallback_text: str,
+    aspect_ratio: str,
+    words_per_line: int = 5,
+) -> str:
+    """Clean grouped subtitle lines. No word highlight. Readable on any background."""
+    rx, ry, margin_v, _ = _get_res_and_margins(aspect_ratio)
+    font_size = 80  # slightly smaller for grouped lines
+
+    style = (
+        f"Style: Sub,{FONT_NAME},{font_size},{TEXT_COLOR},&H000000FF,"
+        f"{OUTLINE_COLOR},{BOX_COLOR},{FONT_BOLD},0,0,0,100,100,1,0,1,4,0,"
+        f"2,{MARGIN_LR},{MARGIN_LR},{margin_v},1"
+    )
+    header = _ass_header(rx, ry, style)
+    lines  = []
+
+    if not words:
+        lines.append(
+            f"Dialogue: 0,{_to_ass_time(0)},{_to_ass_time(clip_duration)},"
+            f"Sub,,0,0,0,,{_escape_ass(fallback_text)}"
+        )
+        return header + "\n".join(lines) + "\n"
+
+    chunks = [words[i: i + words_per_line] for i in range(0, len(words), words_per_line)]
+    for chunk in chunks:
+        if not chunk:
+            continue
+        c_start = max(0.0, chunk[0]["start"]  - clip_start)
+        c_end   = min(clip_duration, chunk[-1]["end"] - clip_start)
+        if c_end <= c_start:
+            continue
+        text = _escape_ass(" ".join(w["word"].strip() for w in chunk))
+        lines.append(
+            f"Dialogue: 0,{_to_ass_time(c_start)},{_to_ass_time(c_end)},"
+            f"Sub,,0,0,0,,{text}"
+        )
+
+    return header + "\n".join(lines) + "\n"
+
+
+# ── Mode 3: Viral hook (hook at top + subtitles at bottom) ───────────────────
+
+def _build_viral_hook_ass(
+    words: List[Dict],
+    clip_start: float,
+    clip_duration: float,
+    fallback_text: str,
+    hook_text: str,
+    aspect_ratio: str,
+) -> str:
+    """
+    Two text layers in one ASS file:
+    - TOP: short hook text in yellow, bold, large — shown for first 2/3 of clip
+    - BOTTOM: word-by-word subtitles in white
+    """
+    rx, ry, margin_v, top_margin = _get_res_and_margins(aspect_ratio)
+    hook_font_size = 110
+
+    styles = (
+        f"Style: Hook,{FONT_NAME},{hook_font_size},{HOOK_COLOR},&H000000FF,"
+        f"{OUTLINE_COLOR},{BOX_COLOR},{FONT_BOLD},0,0,0,100,100,4,0,1,6,0,"
+        f"8,{MARGIN_LR},{MARGIN_LR},{top_margin},1\n"   # alignment 8 = top-center
+        f"Style: Sub,{FONT_NAME},80,{TEXT_COLOR},&H000000FF,"
+        f"{OUTLINE_COLOR},{BOX_COLOR},{FONT_BOLD},0,0,0,100,100,1,0,1,4,0,"
+        f"2,{MARGIN_LR},{MARGIN_LR},{margin_v},1"       # alignment 2 = bottom-center
+    )
+    header = _ass_header(rx, ry, styles)
+    lines  = []
+
+    # Hook line shown for the first 2/3 of the clip
+    hook_end = clip_duration * 0.67
+    if hook_text:
+        escaped_hook = _escape_ass(hook_text.upper())
+        lines.append(
+            f"Dialogue: 0,{_to_ass_time(0)},{_to_ass_time(hook_end)},"
+            f"Hook,,0,0,0,,{escaped_hook}"
+        )
+
+    # Bottom subtitles — word by word
+    if not words:
+        lines.append(
+            f"Dialogue: 0,{_to_ass_time(0)},{_to_ass_time(clip_duration)},"
+            f"Sub,,0,0,0,,{_escape_ass(fallback_text.upper())}"
+        )
+    else:
+        chunks = [words[i: i + WORDS_PER_LINE] for i in range(0, len(words), WORDS_PER_LINE)]
+        for chunk in chunks:
+            if not chunk:
+                continue
+            for active_idx, active_word in enumerate(chunk):
+                w_start = max(0.0, active_word["start"] - clip_start)
+                w_end   = min(clip_duration, active_word["end"] - clip_start)
+                if w_end <= w_start:
+                    continue
+                parts = []
+                for j, w in enumerate(chunk):
+                    word_text = _escape_ass(w["word"].strip().upper())
+                    if j == active_idx:
+                        parts.append(f"{{\\c{HIGHLIGHT_COLOR}&}}{word_text}{{\\c{TEXT_COLOR}&}}")
+                    else:
+                        parts.append(word_text)
+                lines.append(
+                    f"Dialogue: 0,{_to_ass_time(w_start)},{_to_ass_time(w_end)},"
+                    f"Sub,,0,0,0,,{'  '.join(parts)}"
+                )
+
+    return header + "\n".join(lines) + "\n"
+
+
+# ── Mode 4: Caption summary (static single line) ──────────────────────────────
+
+def _build_caption_summary_ass(
+    clip_start: float,
+    clip_duration: float,
+    summary_text: str,
+    aspect_ratio: str,
+) -> str:
+    """One static summary sentence shown for the full clip duration."""
+    rx, ry, margin_v, _ = _get_res_and_margins(aspect_ratio)
+    font_size = 85
+
+    style = (
+        f"Style: Sum,{FONT_NAME},{font_size},{TEXT_COLOR},&H000000FF,"
+        f"{OUTLINE_COLOR},{BOX_COLOR},{FONT_BOLD},0,0,0,100,100,1,0,1,4,0,"
+        f"2,{MARGIN_LR},{MARGIN_LR},{margin_v},1"
+    )
+    header = _ass_header(rx, ry, style)
+    text   = _escape_ass(summary_text)
+    line   = (
+        f"Dialogue: 0,{_to_ass_time(0)},{_to_ass_time(clip_duration)},"
+        f"Sum,,0,0,0,,{text}"
+    )
+    return header + line + "\n"
+
+
+# ── ASS router — picks the right builder based on mode ───────────────────────
+
+def build_ass_file(
+    text_mode: str,
+    words: List[Dict],
+    clip_start: float,
+    clip_duration: float,
+    clip_text: str,
+    aspect_ratio: str,
+) -> str:
+    """
+    Route to the correct ASS builder based on text_mode.
+    This is the single entry point from export_clips().
+    """
+    bottom_text, top_text = build_text_layers(
+        clip_text=clip_text,
+        words=words,
+        clip_start=clip_start,
+        clip_duration=clip_duration,
+        text_mode=text_mode,
+        aspect_ratio=aspect_ratio,
+    )
+
+    if text_mode == "raw_transcript":
+        return _build_raw_transcript_ass(
+            words=words, clip_start=clip_start, clip_duration=clip_duration,
+            fallback_text=bottom_text, aspect_ratio=aspect_ratio,
+        )
+
+    elif text_mode == "clean_subtitle":
+        return _build_clean_subtitle_ass(
+            words=words, clip_start=clip_start, clip_duration=clip_duration,
+            fallback_text=bottom_text, aspect_ratio=aspect_ratio,
+        )
+
+    elif text_mode == "viral_hook":
+        return _build_viral_hook_ass(
+            words=words, clip_start=clip_start, clip_duration=clip_duration,
+            fallback_text=bottom_text, hook_text=top_text, aspect_ratio=aspect_ratio,
+        )
+
+    elif text_mode == "caption_summary":
+        return _build_caption_summary_ass(
+            clip_start=clip_start, clip_duration=clip_duration,
+            summary_text=bottom_text, aspect_ratio=aspect_ratio,
+        )
+
+    else:
+        # Unknown mode — fall back to raw
+        return _build_raw_transcript_ass(
+            words=words, clip_start=clip_start, clip_duration=clip_duration,
+            fallback_text=clip_text, aspect_ratio=aspect_ratio,
+        )
+
+
+# ── SRT export (unchanged) ────────────────────────────────────────────────────
 
 def _to_srt_time(seconds: float) -> str:
-    """Convert seconds to SRT timestamp format: HH:MM:SS,mmm"""
     seconds = max(0.0, seconds)
     h  = int(seconds // 3600)
     m  = int((seconds % 3600) // 60)
@@ -143,131 +345,66 @@ def _to_srt_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def _build_srt(
-    words: List[Dict],
-    clip_start: float,
-    clip_duration: float,
-    fallback_text: str = "",
-    words_per_block: int = 6,
-) -> str:
-    """
-    Build a standard SRT subtitle file for a clip.
-    Groups words into blocks of words_per_block for readable subtitle chunks.
-    This file can be uploaded directly to TikTok, YouTube, or Instagram.
-
-    Args:
-        words:          Word-level timestamps from Whisper.
-        clip_start:     When the clip starts in the original video (for offsetting).
-        clip_duration:  Length of the clip in seconds.
-        fallback_text:  Used if no word timestamps exist.
-        words_per_block: How many words per subtitle line (6 is readable on mobile).
-    """
+def _build_srt(words, clip_start, clip_duration, fallback_text="", words_per_block=6):
     if not words:
-        # Fallback: one subtitle block for the whole clip
-        return (
-            f"1\n"
-            f"{_to_srt_time(0)} --> {_to_srt_time(clip_duration)}\n"
-            f"{fallback_text.strip()}\n\n"
-        )
+        return f"1\n{_to_srt_time(0)} --> {_to_srt_time(clip_duration)}\n{fallback_text.strip()}\n\n"
 
     blocks = []
     chunks = [words[i: i + words_per_block] for i in range(0, len(words), words_per_block)]
-
     for idx, chunk in enumerate(chunks):
         if not chunk:
             continue
-        block_start = max(0.0, chunk[0]["start"] - clip_start)
-        block_end   = min(clip_duration, chunk[-1]["end"] - clip_start)
-        if block_end <= block_start:
+        b_start = max(0.0, chunk[0]["start"]  - clip_start)
+        b_end   = min(clip_duration, chunk[-1]["end"] - clip_start)
+        if b_end <= b_start:
             continue
         text = " ".join(w["word"].strip() for w in chunk)
-        blocks.append(
-            f"{idx + 1}\n"
-            f"{_to_srt_time(block_start)} --> {_to_srt_time(block_end)}\n"
-            f"{text}\n"
-        )
+        blocks.append(f"{idx+1}\n{_to_srt_time(b_start)} --> {_to_srt_time(b_end)}\n{text}\n")
 
     return "\n".join(blocks) + "\n"
 
 
-# ── ffmpeg helpers ────────────────────────────────────────────────────────────
-
-
+# ── Face detection (unchanged) ────────────────────────────────────────────────
 
 def _detect_face_crop(video_path: str, aspect_ratio: str) -> str:
-    """
-    Sample frames from the video and detect the most common face position.
-    Returns an ffmpeg crop filter string centered on the face.
-    Falls back to center crop if OpenCV is unavailable or no face is found.
-
-    This makes vertical crops look professional — the speaker stays in frame
-    even if they are not perfectly centered in the original video.
-    """
     if not OPENCV_AVAILABLE or aspect_ratio != "vertical":
         return ASPECT_RATIOS.get(aspect_ratio, ASPECT_RATIOS["vertical"])[2]
-
     try:
         cap = cv2.VideoCapture(video_path)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25
+        fps    = cap.get(cv2.CAP_PROP_FPS) or 25
         orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-        face_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        )
-
-        # Sample one frame every 2 seconds
-        sample_interval = max(1, int(fps * 2))
-        face_x_positions = []
-
-        for frame_idx in range(0, min(total_frames, int(fps * 60)), sample_interval):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        interval     = max(1, int(fps * 2))
+        face_x = []
+        for fi in range(0, min(total, int(fps * 60)), interval):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
             ret, frame = cap.read()
             if not ret:
                 continue
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             faces = face_cascade.detectMultiScale(gray, 1.1, 4, minSize=(60, 60))
             for (x, y, w, h) in faces:
-                face_x_positions.append(x + w // 2)
-
+                face_x.append(x + w // 2)
         cap.release()
-
-        if not face_x_positions:
+        if not face_x:
             return ASPECT_RATIOS["vertical"][2]
-
-        # Average face center X position
-        avg_face_x = int(sum(face_x_positions) / len(face_x_positions))
-
-        # Target output: 1080 wide from a 1920-tall source
-        target_w = 1080
-        target_h = 1920
-
-        # Scale the original so height = 1920
-        scale = target_h / orig_h
+        avg_x    = int(sum(face_x) / len(face_x))
+        scale    = 1920 / orig_h
         scaled_w = int(orig_w * scale)
-
-        # Crop X centered on face, clamped to bounds
-        crop_x = int(avg_face_x * scale) - target_w // 2
-        crop_x = max(0, min(crop_x, scaled_w - target_w))
-
-        filter_str = (
-            f"scale={scaled_w}:{target_h},"
-            f"crop={target_w}:{target_h}:{crop_x}:0"
-        )
-        print(f"  Face detected at avg x={avg_face_x}px → smart crop offset x={crop_x}")
-        return filter_str
-
+        crop_x   = max(0, min(int(avg_x * scale) - 540, scaled_w - 1080))
+        print(f"  Face reframe: avg_x={avg_x}px → crop_x={crop_x}")
+        return f"scale={scaled_w}:1920,crop=1080:1920:{crop_x}:0"
     except Exception as e:
-        print(f"  Face detection failed ({e}), using center crop.")
+        print(f"  Face detection error ({e}), using center crop.")
         return ASPECT_RATIOS["vertical"][2]
+
 
 def _run_ffmpeg(command: str) -> bool:
     try:
-        subprocess.run(
-            command, shell=True, check=True,
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-        )
+        subprocess.run(command, shell=True, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         return True
     except subprocess.CalledProcessError as e:
         print(f"  ffmpeg error: {e.stderr.decode(errors='replace')}")
@@ -281,7 +418,7 @@ def _ffmpeg_path(path: str) -> str:
     return path
 
 
-def _extract_words(whisper_result: dict, clip_start: float, clip_end: float) -> List[Dict]:
+def _extract_words(whisper_result, clip_start, clip_end):
     words = []
     for segment in whisper_result.get("segments", []):
         for w in segment.get("words", []):
@@ -297,40 +434,28 @@ def export_clips(
     clips: List[Dict],
     output_dir: str,
     whisper_result: dict = None,
-    headlines=None,                              # ignored, kept for compatibility
-    aspect_ratio: str = "vertical",             # vertical | square | horizontal
-    export_srt: bool = True,                    # whether to also save .srt files
-    smart_reframe: bool = True,                 # use face detection for crop position
+    headlines=None,
+    aspect_ratio: str = "vertical",
+    export_srt: bool = True,
+    smart_reframe: bool = True,
+    text_mode: str = "raw_transcript",
     progress_callback: Optional[Callable] = None,
 ) -> List[str]:
     """
-    For each clip:
-    1. Cut from source video and crop to chosen aspect ratio
-    2. Burn Opus-style captions into video
-    3. Export an SRT subtitle file alongside the video
-    4. Clean up temp files
+    Cut, caption, and export each clip.
 
     Args:
-        video_path:    Source video file.
-        clips:         List of clip dicts from get_top_clips().
-        output_dir:    Where to save finished files.
-        whisper_result: Full transcription output (for word timestamps).
-        aspect_ratio:  'vertical' (9:16), 'square' (1:1), 'horizontal' (16:9).
-        export_srt:    If True, saves a .srt file for each clip.
-        progress_callback: Called with (clips_done, total) after each clip.
-
-    Returns:
-        List of paths to finished .mp4 files.
+        text_mode: One of 'raw_transcript', 'clean_subtitle',
+                   'viral_hook', 'caption_summary'.
+                   Controls how captions appear on the exported video.
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    ratio_config = ASPECT_RATIOS.get(aspect_ratio, ASPECT_RATIOS["vertical"])
-    # Use face detection to find smart crop position (falls back to center if unavailable)
     if smart_reframe and OPENCV_AVAILABLE and aspect_ratio == "vertical":
-        print("  Detecting face position for smart reframing...")
+        print("  Detecting face for smart reframing...")
         vf_filter = _detect_face_crop(video_path, aspect_ratio)
     else:
-        vf_filter = ratio_config[2]
+        vf_filter = ASPECT_RATIOS.get(aspect_ratio, ASPECT_RATIOS["vertical"])[2]
 
     exported = []
     total    = len(clips)
@@ -347,8 +472,7 @@ def export_clips(
         final_path = f"{prefix}_final.mp4"
         srt_path   = f"{prefix}_captions.srt"
 
-        # ── Step 1: Cut + crop ────────────────────────────────────────────────
-        print(f"[{clip_num}/{total}] Cutting clip ({aspect_ratio})...")
+        print(f"[{clip_num}/{total}] Cutting clip ({aspect_ratio}, {text_mode})...")
         cut_cmd = (
             f'ffmpeg -y -i "{video_path}" '
             f'-ss {start:.3f} -t {duration:.3f} '
@@ -356,46 +480,41 @@ def export_clips(
             f'-c:a copy "{raw_path}"'
         )
         if not _run_ffmpeg(cut_cmd):
-            print(f"  ✗ Clip {clip_num} cut failed, skipping.")
+            print(f"  ✗ Cut failed, skipping clip {clip_num}.")
             continue
 
-        # ── Step 2: Extract word timestamps ──────────────────────────────────
         words = _extract_words(whisper_result, start, end) if whisper_result else []
 
-        # ── Step 3: Build and burn ASS captions ──────────────────────────────
-        ass_content = _build_opus_captions_ass(
+        # Build the ASS subtitle file using the selected text mode
+        ass_content = build_ass_file(
+            text_mode=text_mode,
             words=words,
             clip_start=start,
             clip_duration=duration,
-            fallback_text=clip.get("text", ""),
+            clip_text=clip.get("text", ""),
             aspect_ratio=aspect_ratio,
         )
         with open(ass_path, "w", encoding="utf-8") as f:
             f.write(ass_content)
 
-        print(f"[{clip_num}/{total}] Burning captions...")
+        print(f"[{clip_num}/{total}] Burning captions ({text_mode})...")
         burn_cmd = (
             f'ffmpeg -y -i "{raw_path}" '
             f'-vf "subtitles=\'{_ffmpeg_path(ass_path)}\'" '
             f'-c:a copy "{final_path}"'
         )
         if not _run_ffmpeg(burn_cmd):
-            print(f"  ✗ Clip {clip_num} caption burn failed, skipping.")
+            print(f"  ✗ Caption burn failed, skipping clip {clip_num}.")
             continue
 
-        # ── Step 4: Export SRT file ───────────────────────────────────────────
         if export_srt:
             srt_content = _build_srt(
-                words=words,
-                clip_start=start,
-                clip_duration=duration,
-                fallback_text=clip.get("text", ""),
+                words=words, clip_start=start,
+                clip_duration=duration, fallback_text=clip.get("text", ""),
             )
             with open(srt_path, "w", encoding="utf-8") as f:
                 f.write(srt_content)
-            print(f"  ✓ SRT saved → {srt_path}")
 
-        # ── Cleanup temp files ────────────────────────────────────────────────
         for temp in [raw_path, ass_path]:
             try:
                 os.remove(temp)
