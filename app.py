@@ -312,30 +312,127 @@ with tab_clip:
         top_clips = st.session_state["clips"]
 
         st.subheader("👀 Review & Approve Clips")
-        st.caption("Tick the clips you want. Uncheck any you don't. Then export.")
+        st.caption("Check the clips you want to export. Uncheck any you want to skip.")
+
+        # ── Clip cards — Opus Clip inspired ───────────────────────────────────
+        st.markdown("""
+        <style>
+        .clip-card {
+            border: 1px solid #e0e0e0;
+            border-radius: 14px;
+            padding: 18px 20px;
+            margin-bottom: 14px;
+            background: #fafafa;
+        }
+        .clip-card-selected {
+            border: 2px solid #1D9E75;
+            background: #f0faf6;
+        }
+        .score-badge {
+            display: inline-block;
+            background: #1D9E75;
+            color: white;
+            font-weight: 700;
+            font-size: 18px;
+            border-radius: 50%;
+            width: 48px;
+            height: 48px;
+            line-height: 48px;
+            text-align: center;
+        }
+        .score-badge-low {
+            background: #e0e0e0;
+            color: #666;
+        }
+        .clip-title {
+            font-size: 15px;
+            font-weight: 600;
+            color: #1a1a1a;
+            margin: 0;
+        }
+        .clip-meta {
+            font-size: 12px;
+            color: #888;
+            margin-top: 3px;
+        }
+        .clip-transcript {
+            font-size: 13px;
+            color: #444;
+            margin-top: 10px;
+            line-height: 1.6;
+            border-left: 3px solid #1D9E75;
+            padding-left: 10px;
+        }
+        .duration-pill {
+            display: inline-block;
+            background: #EEF2FF;
+            color: #3730A3;
+            font-size: 11px;
+            font-weight: 600;
+            padding: 2px 9px;
+            border-radius: 99px;
+        }
+        .platform-pill {
+            display: inline-block;
+            background: #FEF3C7;
+            color: #92400E;
+            font-size: 11px;
+            font-weight: 600;
+            padding: 2px 9px;
+            border-radius: 99px;
+            margin-left: 5px;
+        }
+        </style>
+        """, unsafe_allow_html=True)
 
         approved_flags = []
         for i, clip in enumerate(top_clips):
             duration_val = clip.get("duration", clip["end"] - clip["start"])
-            source = clip.get("source_file", "")
-            col_check, col_info = st.columns([0.08, 0.92])
+            source       = clip.get("source_file", "")
+            score        = clip.get("score", 0)
+            text         = clip.get("text", "")
+            preview_text = text[:120] + "..." if len(text) > 120 else text
+
+            # Auto-generate a short clip title from the first sentence
+            import re
+            sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+            first_sentence = sentences[0][:55] if sentences else text[:55]
+            clip_title = first_sentence.rstrip(".,") if first_sentence else f"Clip {i+1}"
+
+            # Score color: green if high, grey if low
+            score_display = min(99, max(1, score + 50))  # normalize to 1-99 range for display
+            score_class   = "score-badge" if score_display >= 55 else "score-badge score-badge-low"
+
+            col_check, col_card = st.columns([0.07, 0.93])
+
             with col_check:
+                st.markdown("<div style='margin-top:18px'></div>", unsafe_allow_html=True)
                 checked = st.checkbox("", value=True, key=f"approve_{i}")
                 approved_flags.append(checked)
-            with col_info:
-                label = f"Clip {i+1}  ·  {duration_val:.0f}s  ·  Score: {clip['score']}"
-                if source:
-                    label += f"  ·  {source}"
-                with st.expander(label, expanded=False):
-                    st.write(clip["text"])
-                    st.caption(
-                        f"Start: {clip['start']:.1f}s → End: {clip['end']:.1f}s  |  "
-                        f"Pause before: {clip.get('gap_before', 0):.1f}s  |  "
-                        f"Pause after: {clip.get('gap_after', 0):.1f}s"
-                    )
+
+            with col_card:
+                card_class = "clip-card clip-card-selected" if checked else "clip-card"
+                duration_str = f"{duration_val:.0f}s"
+
+                st.markdown(f"""
+                <div class="{card_class}">
+                    <div style="display:flex; align-items:flex-start; gap:14px;">
+                        <div class="{score_class}">{score_display}</div>
+                        <div style="flex:1">
+                            <p class="clip-title">#{i+1} {clip_title}</p>
+                            <p class="clip-meta">
+                                <span class="duration-pill">⏱ {duration_str}</span>
+                                {'<span class="platform-pill">📁 ' + source + '</span>' if source else ''}
+                                <span style="margin-left:8px; color:#aaa">{clip['start']:.1f}s → {clip['end']:.1f}s</span>
+                            </p>
+                            <p class="clip-transcript">{preview_text}</p>
+                        </div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
 
         approved_count = sum(approved_flags)
-        st.write(f"**{approved_count} of {len(top_clips)} clips selected.**")
+        st.markdown(f"**{approved_count} of {len(top_clips)} clips selected for export.**")
 
         if st.button(f"✂️ Export {approved_count} Clips", disabled=approved_count == 0):
             approved_clips = [c for c, f in zip(top_clips, approved_flags) if f]
