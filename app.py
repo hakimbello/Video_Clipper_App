@@ -473,55 +473,111 @@ with tab_clip:
             st.session_state["final_clips"] = approved_clips
             st.rerun()
 
-    # ── Step 3: Downloads + feedback ──────────────────────────────────────────
+    # ── Step 3: Preview + Download + Feedback ────────────────────────────────
     if st.session_state.get("exported"):
         final_clips = st.session_state.get("final_clips", [])
 
-        st.subheader("📥 Download Your Clips")
-        st.caption("Download clips and rate them — ratings teach the app your preferences.")
+        st.subheader("🎬 Your Clips")
+        st.caption("Watch each clip, download what you want, and rate them to improve future selections.")
 
         any_found = False
         for i, clip in enumerate(final_clips):
-            final_path = OUTPUT_DIR / f"clip_{i+1}_final.mp4"
-            srt_path   = OUTPUT_DIR / f"clip_{i+1}_captions.srt"
+            final_path   = OUTPUT_DIR / f"clip_{i+1}_final.mp4"
+            srt_path     = OUTPUT_DIR / f"clip_{i+1}_captions.srt"
             duration_val = clip.get("duration", clip["end"] - clip["start"])
-            clip_text    = clip["text"][:55] + "..." if len(clip["text"]) > 55 else clip["text"]
+            clip_text    = clip["text"][:80] + "..." if len(clip["text"]) > 80 else clip["text"]
+            score        = clip.get("score", 0)
+            score_display = min(99, max(1, score + 50))
+
+            # Auto-title from first sentence
+            import re as _re
+            sentences    = _re.split(r"(?<=[.!?])\s+", clip.get("text","").strip())
+            clip_title   = (sentences[0][:50].rstrip(".,") if sentences else f"Clip {i+1}")
 
             if final_path.exists():
                 any_found = True
-                col_vid, col_srt, col_like, col_dislike = st.columns([0.5, 0.18, 0.16, 0.16])
 
-                with col_vid:
+                # ── Card wrapper ───────────────────────────────────────────
+                st.markdown(f"""
+                <div style="border:1px solid #e0e0e0; border-radius:14px;
+                            padding:18px 20px; margin-bottom:20px; background:#fafafa;">
+                    <div style="display:flex; align-items:center; gap:12px; margin-bottom:12px;">
+                        <div style="background:#1D9E75; color:white; font-weight:700;
+                                    font-size:16px; border-radius:50%; width:42px; height:42px;
+                                    line-height:42px; text-align:center; flex-shrink:0;">
+                            {score_display}
+                        </div>
+                        <div>
+                            <div style="font-size:15px; font-weight:600; color:#1a1a1a;">
+                                #{i+1} {clip_title}
+                            </div>
+                            <div style="font-size:12px; color:#888; margin-top:2px;">
+                                ⏱ {duration_val:.0f}s &nbsp;·&nbsp;
+                                {clip["start"]:.1f}s → {clip["end"]:.1f}s
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                # ── Video preview + transcript side by side ────────────────
+                col_preview, col_info = st.columns([0.42, 0.58])
+
+                with col_preview:
+                    # Inline video player — plays right in the app
+                    with open(final_path, "rb") as vf:
+                        video_bytes = vf.read()
+                    st.video(video_bytes)
+
+                with col_info:
+                    st.markdown("**Transcript**")
+                    st.markdown(
+                        f"<div style='font-size:13px; color:#444; line-height:1.7; "
+                        f"border-left:3px solid #1D9E75; padding-left:10px; "
+                        f"margin-bottom:14px;'>{clip_text}</div>",
+                        unsafe_allow_html=True
+                    )
+
+                    # Download buttons
                     with open(final_path, "rb") as f:
                         st.download_button(
-                            label=f"⬇️ Clip {i+1} [{duration_val:.0f}s]",
+                            label=f"⬇️ Download Clip {i+1} (.mp4)",
                             data=f.read(),
                             file_name=f"clip_{i+1}.mp4",
                             mime="video/mp4",
                             key=f"dl_mp4_{i}",
+                            use_container_width=True,
                         )
-                with col_srt:
+
                     if export_srt and srt_path.exists():
                         with open(srt_path, "rb") as f:
                             st.download_button(
-                                label="⬇️ SRT",
+                                label="⬇️ Download SRT captions",
                                 data=f.read(),
                                 file_name=f"clip_{i+1}.srt",
                                 mime="text/plain",
                                 key=f"dl_srt_{i}",
+                                use_container_width=True,
                             )
-                with col_like:
-                    if st.button("👍", key=f"like_{i}", help="This was a great clip"):
-                        record_feedback(clip["text"], liked=True)
-                        st.toast("Got it — noted as a great clip!")
 
-                with col_dislike:
-                    if st.button("👎", key=f"dislike_{i}", help="This clip was not good"):
-                        record_feedback(clip["text"], liked=False)
-                        st.toast("Got it — will deprioritize similar moments.")
+                    # Feedback buttons
+                    st.markdown("**Was this a good clip?**")
+                    fb_col1, fb_col2 = st.columns(2)
+                    with fb_col1:
+                        if st.button("👍 Great clip", key=f"like_{i}",
+                                     use_container_width=True):
+                            record_feedback(clip["text"], liked=True)
+                            st.toast("Noted — will prioritize similar moments!")
+                    with fb_col2:
+                        if st.button("👎 Not good", key=f"dislike_{i}",
+                                     use_container_width=True):
+                            record_feedback(clip["text"], liked=False)
+                            st.toast("Noted — will avoid similar moments.")
 
-                st.caption(f'"{clip_text}"')
                 st.divider()
+
+            else:
+                st.warning(f"Clip {i+1} did not export — check ffmpeg is installed.")
 
         if not any_found:
             st.error("No clips exported. Check ffmpeg is installed.")
