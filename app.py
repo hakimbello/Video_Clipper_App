@@ -385,23 +385,31 @@ with tab_clip:
         </style>
         """, unsafe_allow_html=True)
 
+        import re as _re
+
         approved_flags = []
+
+        # Initialize edited transcripts in session state if not already there
+        # This stores any edits the user makes so they survive Streamlit reruns
+        if "edited_transcripts" not in st.session_state:
+            st.session_state["edited_transcripts"] = {
+                i: clip.get("text", "") for i, clip in enumerate(top_clips)
+            }
+
         for i, clip in enumerate(top_clips):
             duration_val = clip.get("duration", clip["end"] - clip["start"])
             source       = clip.get("source_file", "")
             score        = clip.get("score", 0)
             text         = clip.get("text", "")
-            preview_text = text[:120] + "..." if len(text) > 120 else text
 
-            # Auto-generate a short clip title from the first sentence
-            import re
-            sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+            # Auto-title from first sentence
+            sentences      = _re.split(r"(?<=[.!?])\s+", text.strip())
             first_sentence = sentences[0][:55] if sentences else text[:55]
-            clip_title = first_sentence.rstrip(".,") if first_sentence else f"Clip {i+1}"
+            clip_title     = first_sentence.rstrip(".,") if first_sentence else f"Clip {i+1}"
 
-            # Score color: green if high, grey if low
-            score_display = min(99, max(1, score + 50))  # normalize to 1-99 range for display
+            score_display = min(99, max(1, score + 50))
             score_class   = "score-badge" if score_display >= 55 else "score-badge score-badge-low"
+            duration_str  = f"{duration_val:.0f}s"
 
             col_check, col_card = st.columns([0.07, 0.93])
 
@@ -411,8 +419,8 @@ with tab_clip:
                 approved_flags.append(checked)
 
             with col_card:
-                card_class = "clip-card clip-card-selected" if checked else "clip-card"
-                duration_str = f"{duration_val:.0f}s"
+                card_class   = "clip-card clip-card-selected" if checked else "clip-card"
+                source_pill  = f'<span class="platform-pill">📁 {source}</span>' if source else ""
 
                 st.markdown(f"""
                 <div class="{card_class}">
@@ -422,14 +430,54 @@ with tab_clip:
                             <p class="clip-title">#{i+1} {clip_title}</p>
                             <p class="clip-meta">
                                 <span class="duration-pill">⏱ {duration_str}</span>
-                                {'<span class="platform-pill">📁 ' + source + '</span>' if source else ''}
-                                <span style="margin-left:8px; color:#aaa">{clip['start']:.1f}s → {clip['end']:.1f}s</span>
+                                {source_pill}
+                                <span style="margin-left:8px; color:#aaa">{clip["start"]:.1f}s → {clip["end"]:.1f}s</span>
                             </p>
-                            <p class="clip-transcript">{preview_text}</p>
                         </div>
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
+
+                # ── Transcript editor ──────────────────────────────────────
+                # Shown in an expander so the card stays clean by default.
+                # When the user edits and clicks Save, the new text is stored
+                # in session state and will be used when burning captions.
+                with st.expander("✏️ Edit transcript for this clip", expanded=False):
+                    st.caption(
+                        "Edit the text below to fix transcription errors or rewrite it. "
+                        "This is what gets burned into the captions."
+                    )
+                    edited = st.text_area(
+                        label="Transcript",
+                        value=st.session_state["edited_transcripts"].get(i, text),
+                        height=120,
+                        key=f"transcript_edit_{i}",
+                        label_visibility="collapsed",
+                    )
+
+                    col_save, col_reset = st.columns([0.3, 0.7])
+                    with col_save:
+                        if st.button("💾 Save edit", key=f"save_edit_{i}",
+                                     use_container_width=True):
+                            st.session_state["edited_transcripts"][i] = edited
+                            # Update the clip text in session state immediately
+                            st.session_state["clips"][i]["text"] = edited
+                            st.toast(f"Clip {i+1} transcript updated!")
+
+                    with col_reset:
+                        if st.button("↩️ Reset to original", key=f"reset_edit_{i}",
+                                     use_container_width=True):
+                            st.session_state["edited_transcripts"][i] = text
+                            st.session_state["clips"][i]["text"] = text
+                            st.toast(f"Clip {i+1} reset to original transcript.")
+
+                    # Show character count so user knows if text is too long
+                    current_text = st.session_state["edited_transcripts"].get(i, text)
+                    was_edited   = current_text.strip() != text.strip()
+                    if was_edited:
+                        st.success("✓ This transcript has been edited.")
+                    st.caption(f"{len(current_text)} characters · "
+                               f"{len(current_text.split())} words")
 
         approved_count = sum(approved_flags)
         st.markdown(f"**{approved_count} of {len(top_clips)} clips selected for export.**")
